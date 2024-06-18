@@ -1,0 +1,455 @@
+#! groovy
+
+node() {
+     build_timeout = 45
+     lock_app_name = params.APP_NAME.isEmpty() ? !params.GIT_URL.isEmpty() ? params.GIT_URL.toLowerCase().substring(params.GIT_URL.lastIndexOf("/") + 1, params.GIT_URL.length() - 4) : params.GIT_URL : params.APP_NAME
+
+     if (params.GIT_URL.startsWith("https://github.com")) {
+        lock_group_name = params.GIT_URL.toLowerCase().substring(params.GIT_URL.lastIndexOf("github.com/") + 11, params.GIT_URL.lastIndexOf("/"))
+     }
+     else {
+        lock_group_name = params.GIT_URL.toLowerCase().substring(params.GIT_URL.lastIndexOf("scm/") + 4, params.GIT_URL.lastIndexOf("/"))
+     }
+     
+     if ( params.DEPLOY_ENVIRONMENT != null && !params.DEPLOY_ENVIRONMENT.isEmpty() ) {
+        lock_deploy_environment = params.DEPLOY_ENVIRONMENT
+     } else if(params.BRANCH_NAME == 'development') {
+        lock_deploy_environment = 'dev'
+     } else if(params.BRANCH_NAME.toLowerCase().startsWith("release/")) {
+        lock_deploy_environment = 'uat'
+     } else {
+        lock_deploy_environment = 'local'
+     }
+
+     resource_name_to_lock = 'Deployment for ' + lock_deploy_environment + ' env of ' + lock_group_name + '/' + lock_app_name + ' repository'
+}
+
+pipeline {
+    agent any
+
+    environment {
+        TEST1 = 'ENV_TEST1'
+        TEST2 = 'ENV_TEST2'
+        GIT_CREDENTIALS_ID = 'SVC-GIT-USER'
+        GITHUB_CREDENTIALS_ID = "SVC-GITHUB-USER"
+        CONFIG_DIRECTORY = 'pipeline-config'
+        // APP_CONFIG_URL = 'https://github.com/vijaysarde/kubernetes_config.git'
+        APP_CONFIG_URL = 'https://github.com/vijaysarde/upstreampipeline.git'
+        // SHARED_GROOVY_GIT_URL = 'https://github.com/vijaysarde/shared-groovy.git'
+        SHARED_GROOVY_GIT_URL = 'https://github.com/vijaysarde/upstreampipeline.git'
+        SHARED_GROOVY_SRC_DIRECTORY = 'src/main/groovy/com/visa/pipeline/stages'
+        SHARED_RESOURCES_DIRECTORY = 'src/main/resources'
+    }
+
+    parameters {
+        string(name: 'GIT_URL', defaultValue: 'DEFAULT_URL', description: 'URL of upstream repo from where this job got triggered')
+        string(name: 'BRANCH_NAME', defaultValue: 'DEFAULT_BRANCH', description: 'Branch of upstream repo from where this job got triggered')
+        string(name: 'APP_NAME', defaultValue: '')
+        string(name: 'APP_VERSION', defaultValue: '')
+        string(name: 'GROUP_NAME', defaultValue: '')
+        string(name: 'DEPLOY_ENVIRONMENT', defaultValue: '')
+        string(name: 'DEPLOYMENT_REGION', defaultValue: 'US')
+        string(name: 'PIPELINE_CONFIG_BRANCH_NAME', defaultValue: 'main')
+        string(name: 'JENKINS_SLAVE_1', defaultValue: 'workernode-1')
+        string(name: 'JENKINS_SLAVE_2', defaultValue: 'workernode-2')
+        booleanParam(name: 'NEW_PIPELINE', defaultValue: true)
+        string(name: 'DEPLOYMENT_STRATEGY', defaultValue: 'Normal')
+        string(name: 'PROGRESSIVE_DEPLOY_ENV', defaultValue: '')
+        string(name: 'DEPLOYMENT_TYPE', defaultValue: 'kubernetes')
+    }
+
+    options {
+        timeout(time: build_timeout, unit: 'MINUTES')
+        buildDiscarder(logRotator(numToKeepStr: '45'))
+        lock(resource: resource_name_to_lock, variable: 'downstream_job_cicd_var') // Make sure you've installed - 'Lockable Resources' plugin
+        timestamps()
+    }
+
+    stages {
+        stage('Pull Latest Code') {
+            when {
+                //skip step if expression returns false
+                expression {
+                    node() {
+                    	echo "PIPELINE_CONFIG_BRANCH_NAME: ${params.PIPELINE_CONFIG_BRANCH_NAME}"
+                        echo "NODE_NAME: $NODE_NAME"
+                        echo "NEW_PIPELINE: ${params.NEW_PIPELINE}"
+                        echo "${params.JENKINS_SLAVE_1} , ${params.JENKINS_SLAVE_2}"
+                        echo "Current Workspace: $WORKSPACE"
+
+                        if(Boolean.valueOf(NEW_PIPELINE)){
+                            getSlaveNode()
+                            //Commenting below line until I provide specific action to jenkins user 15:05:55  ERROR: Checkout failed // 15:05:55  java.nio.file.AccessDeniedException: /apps
+                            // setWorkSpace(DEPLOYMENT_REGION)
+                        }
+
+                        PIPELINE_NODE = NODE_NAME
+                        return initPipeline()
+                    }
+                }
+            }
+            steps {
+                script {
+                    try {
+                        node(PIPELINE_NODE) {
+                            //check out project (if the image doesn't exists)
+                            echo "Application Repo Clone: Cloning '${params.BRANCH_NAME}' branch '${params.GIT_URL}' repository."
+                            if (params.GIT_URL != 'all' && (params.APP_VERSION.isEmpty() || DEPLOY_ENVIRONMENT == 'dev' || DEPLOY_ENVIRONMENT.contains('uat') || DEPLOY_ENVIRONMENT == 'local')) {
+                                checkoutBranch(params.GIT_URL, params.BRANCH_NAME, APP_WORKSPACE, null)
+                            }
+                            else {
+                                sh "mkdir -p ${APP_WORKSPACE}"
+                            }
+
+                            //check out shared src and resources from shared groovy
+                            if (!fileExists("$CONFIG_DIRECTORY")){
+                                echo "Shared Groovy Repo Clone: Cloning '${params.PIPELINE_CONFIG_BRANCH_NAME}' branch '${SHARED_GROOVY_GIT_URL}' repository."
+                                checkoutBranch(SHARED_GROOVY_GIT_URL, params.PIPELINE_CONFIG_BRANCH_NAME, CONFIG_DIRECTORY, "$SHARED_GROOVY_SRC_DIRECTORY,$SHARED_RESOURCES_DIRECTORY")
+                            } else {
+                                echo "${CONFIG_DIRECTORY} already exists, no need to clone it again."
+                            }
+                                
+
+                            // check out application specific configuration files like application.yml, entrypoint.sh, Dockerfile
+                            if (!INIT_PIPELINE) {
+                                echo "Application Config Repo Clone: Cloning '${params.PIPELINE_CONFIG_BRANCH_NAME}' branch '${APP_CONFIG_URL}' repository."
+                                checkoutBranch(APP_CONFIG_URL, params.PIPELINE_CONFIG_BRANCH_NAME, "$APP_WORKSPACE/$CONFIG_DIRECTORY", "$GROUP_NAME/$ORIGINAL_APP_NAME")
+                            }
+
+                            //load config
+                            loadConfig()
+
+                        }
+                    }
+                    catch (Exception e) {
+                    echo "$e"
+                    logger.stepFailed(e.getMessage(), BUILD_STATUS_FAILURE)
+                    }
+                }
+            }
+        }
+    }
+}
+
+
+//Iterate through nodes of jenkins
+//check if input node from user is active and present in list of nodes
+//Switch the node to the input slave
+def getSlaveNode() {
+    echo "TRACKER || Jenkinsfile || getSlaveNode()"
+    if(!(params.JENKINS_SLAVE_1.isEmpty() || params.JENKINS_SLAVE_2.isEmpty())){
+        println "Available Nodes: ${Jenkins.instance.nodes}"
+        for (node in Jenkins.instance.nodes) {
+            println "${node.name}, ${node.numExecutors}"
+            def computer = node.computer
+            println "Online: ${computer.online}, ${computer.connectTime} (${computer.offlineCauseReason})"
+            if(computer.online && (node.name.equals(params.JENKINS_SLAVE_1) || node.name.equals(params.JENKINS_SLAVE_2))){
+                NODE_NAME="${node.name}"
+                println "Input node found healthy and pipeline will be running on $NODE_NAME"
+                break
+            }
+        }
+    }
+}
+
+
+
+def setWorkSpace(def areaCode) {
+    echo "TRACKER || Jenkinsfile || setWorkSpace(def areaCode)"
+    echo "Deployment Region:  $areaCode"
+
+    // Define workspace paths as constants
+    final US_WORKSPACE = "/apps/jenkins/workspace/global_docker-pipeline_master"
+    final EMEA_WORKSPACE = "/apps/jenkins-nam/workspace/global_docker-pipeline_master"
+    final APAC_WORKSPACE = "/apps/jenkins-nam/workspace/global_docker-pipeline_master"
+    final AWS_WORKSPACE = "/apps/jenkins/workspace/global_docker-pipeline_master"
+
+    // Use a switch statement to map areaCode to workspace path
+    switch (areaCode) {
+        case 'US':
+            WORKSPACE = US_WORKSPACE
+            break
+        case 'EMEA':
+            WORKSPACE = EMEA_WORKSPACE
+            break
+        case 'APAC':
+            WORKSPACE = APAC_WORKSPACE
+            break
+        case 'AWS':
+            WORKSPACE = AWS_WORKSPACE
+            break
+        default:
+            "Unsupported deployent region: $areaCode"
+            
+    }
+
+    echo "Updated Workspace: $WORKSPACE"
+
+    // return WORKSPACE
+}
+
+
+/**
+ * Initialize the pipeline (using the can execute step value)
+ *
+ * @return can execute step flag
+ */
+def initPipeline() {
+
+	echo "TRACKER || Jenkinsfile || initPipeline()"
+    //init vars
+    INIT_PIPELINE = false
+    IS_JENKINS_USER = false
+    CONFIG_INITIALIZED = false
+    JENKINS_USER_EMAIL = 'jenkins@visa.com'
+    DOCKER_IMAGE_EXISTS = false
+    env.JIRA_DEPLOY_ON_DEMAND = false
+    DOCKER_SERVICE_INITIATION=''
+    ATTACHMENT_LIST =[]
+    //set deployment environment / test deploy values (used in email)
+    DEPLOY_ENVIRONMENT = params.DEPLOY_ENVIRONMENT
+    DEPLOYMENT_STRATEGY = params.DEPLOYMENT_STRATEGY
+    PROGRESSIVE_DEPLOY_ENV = params.PROGRESSIVE_DEPLOY_ENV
+    ORIGINAL_DEPLOY_ENVIRONMENT = DEPLOY_ENVIRONMENT
+    IS_NEW_PIPELINE=params.NEW_PIPELINE
+    env.NEW_PIPELINE=IS_NEW_PIPELINE
+    env.DEPLOYMENT_TYPE = params.DEPLOYMENT_TYPE
+    loadAppConfig(DEPLOYMENT_TYPE)
+
+    ATTACHMENT_LIST =[]
+
+    //set git branch name
+    setGitBranchName()
+
+    //update the deploy environment
+    setDeployEnvironment()
+
+
+    //set group name
+    setGroupName()
+
+    //set app name
+    setAppName()
+
+    //set the app workspace
+    setAppWorkspace()
+
+    //init step flag
+    CAN_EXECUTE_STEP = !params.GIT_URL.isEmpty() || (DEPLOY_ENVIRONMENT != null && !DEPLOY_ENVIRONMENT.isEmpty())
+
+
+    BRANCH_CONFIG_LOADED = CAN_EXECUTE_STEP
+
+    echo "Pipeline Initialized: $BRANCH_CONFIG_LOADED"
+    return CAN_EXECUTE_STEP
+}
+
+/**
+ * Updates the staging branch name (matching used in switch case)
+ */
+def setDeployEnvironment() {
+    echo "TRACKER || Jenkinsfile || updateDeployEnvironment()"
+    if ( params.DEPLOY_ENVIRONMENT != null && !params.DEPLOY_ENVIRONMENT.isEmpty() ) {
+        DEPLOY_ENVIRONMENT = params.DEPLOY_ENVIRONMENT
+     } else if(params.BRANCH_NAME == 'development') {
+        DEPLOY_ENVIRONMENT = 'dev'
+     } else if(params.BRANCH_NAME.toLowerCase().startsWith("release/")) {
+        DEPLOY_ENVIRONMENT = 'uat'
+     } else {
+        DEPLOY_ENVIRONMENT = 'local'
+     }
+
+    env.ENV = DEPLOY_ENVIRONMENT
+    env.ORIGINAL_ENV = ENV
+
+    echo "Deployment Environment: $ORIGINAL_ENV"
+}
+
+
+
+/**
+ * Sets the app name
+ */
+def setAppName() {
+	echo "TRACKER || Jenkinsfile || setAppName()"
+    if (params.GIT_URL == 'all' ) {
+        env.APP_NAME = "all"
+    }
+    else {
+        env.APP_NAME = params.APP_NAME.isEmpty() ? !params.GIT_URL.isEmpty() ? params.GIT_URL.toLowerCase().substring(params.GIT_URL.lastIndexOf("/") + 1, params.GIT_URL.length() - 4) : params.GIT_URL : params.APP_NAME
+    }
+    env.ORIGINAL_APP_NAME = APP_NAME
+    env.APP_NAME = "$APP_NAME-$DEPLOY_ENVIRONMENT".replaceAll("\\.", "")
+    INIT_PIPELINE = Boolean.valueOf(APP_NAME == '-')
+    echo "App Name: $ORIGINAL_APP_NAME"
+    echo "Updated App Name: $APP_NAME"
+}
+
+/**
+ * Sets the group name
+ */
+def setGroupName() {
+	echo "TRACKER || Jenkinsfile || setGroupName()"
+    echo "Repository URL:  ${params.GIT_URL}"
+    if (params.GIT_URL == 'all' ) {
+        env.GROUP_NAME = "all"
+    }
+    else if (params.GIT_URL.startsWith("https://github.com")) {
+        env.GROUP_NAME = params.GROUP_NAME.isEmpty() ? !params.GIT_URL.isEmpty() ? params.GIT_URL.toLowerCase().substring(params.GIT_URL.lastIndexOf("github.com/") + 11, params.GIT_URL.lastIndexOf("/")) : params.GIT_URL : params.GROUP_NAME
+    }
+    else {
+        env.GROUP_NAME = params.GROUP_NAME.isEmpty() ? !params.GIT_URL.isEmpty() ? params.GIT_URL.toLowerCase().substring(params.GIT_URL.lastIndexOf("scm/") + 4, params.GIT_URL.lastIndexOf("/")) : params.GIT_URL : params.GROUP_NAME
+    }
+    echo "Group/Owner Name: $GROUP_NAME"
+}
+
+/**
+ * Sets the git branch name
+ */
+def setGitBranchName() {
+    echo "TRACKER || Jenkinsfile || setGitBranchName()"
+    env.GIT_BRANCH_NAME = params.BRANCH_NAME.replace("origin/", "")
+    echo "Branch Name: $GIT_BRANCH_NAME"
+}
+
+/**
+ * Sets the app workspace
+ */
+def setAppWorkspace() {
+    echo "TRACKER || Jenkinsfile || setAppWorkspace()"
+    env.APP_WORKSPACE = "$WORKSPACE/$APP_NAME-$BUILD_NUMBER"
+    env.ORIGINAL_APP_WORKSPACE = APP_WORKSPACE
+    echo "App Workspace: $ORIGINAL_APP_WORKSPACE"
+}
+
+
+
+/**
+ * Load the pipeline config
+ */
+def loadConfig() {
+    //load config scripts
+    echo "TRACKER || Jenkinsfile || loadConfig()"
+    loadConfigScripts()
+
+    //load branch config
+    setEnvVars.loadBranchConfig()
+
+    // printing env var to make sure our setup is working
+    echo "APP_LEVEL_ENV_CONFIG: ${APP_LEVEL_ENV_CONFIG}"
+    echo "GLOBAL_LEVEL_ENV_CONFIG: ${GLOBAL_LEVEL_ENV_CONFIG}"
+
+    //set commit email address
+    setEnvVars.setCommitEmailAddress()
+    env.LAST_COMMIT_BY_JENKINS=lastCommitByJenkins()
+
+
+
+    //only send emails, when the commit isn't from jenkins making a release tag
+    echo "lastCommitByJenkins $LAST_COMMIT_BY_JENKINS"
+    IS_JENKINS_USER = Boolean.valueOf(LAST_COMMIT_BY_JENKINS)
+    echo "IS_JENKINS_USER $IS_JENKINS_USER"
+
+
+    //skip all the steps when build is coming from jenkins user
+    CAN_EXECUTE_STEP = !IS_JENKINS_USER
+
+    CONFIG_INITIALIZED = true
+    echo "Config Initialized: $CONFIG_INITIALIZED"
+
+    //make sure any jenkins template changes have only been made by a lead
+    // if (!IS_JENKINS_USER) {
+    //     //if the jenkins template has been changed, see who made the change
+    //     if (templateManager.jenkinsTemplateChanged() && !templateManager.jenkinsTemplateChangedByLead()) {
+    //         //revert the jenkins template
+    //         templateManager.revertJenkinsTemplate()
+    //     }
+    // }
+}
+
+
+
+/**
+ * Loads the config scripts
+ */
+def loadConfigScripts() {
+    //load config scripts
+    echo "TRACKER || Jenkinsfile || loadConfigScripts()"
+    setEnvVars = load "$CONFIG_DIRECTORY/$SHARED_GROOVY_SRC_DIRECTORY/setEnvVars.groovy"
+}
+
+def loadAppConfig(def deploymentType){
+  echo "TRACKER || Jenkinsfile || loadAppConfig(def deploymentType)"
+  echo "Deployment Type: $deploymentType"
+  // Define workspace paths as constants
+  //   final KUBERNETES_CONFIG_URL = "https://github.com/vijaysarde/kubernetes_config.git"
+  final KUBERNETES_CONFIG_URL = "https://github.com/vijaysarde/upstreampipeline.git"
+  //   final DOCKER_CONFIG_URL = "https://github.com/vijaysarde/docker_config.git"
+  final DOCKER_CONFIG_URL = "https://github.com/vijaysarde/upstreampipeline.git"
+
+  switch (deploymentType) {
+	case 'docker':
+                APP_CONFIG_URL = DOCKER_CONFIG_URL
+                break
+	case 'kubernetes':
+                APP_CONFIG_URL = KUBERNETES_CONFIG_URL
+                break
+	default:
+		'No DEPLOYMENT_TYPE  specified'
+    }
+
+    echo "Application Configuration Repository : $APP_CONFIG_URL"
+  }
+
+  /**
+ * Checks the last commit, to see if it was from the jenkins user
+ * The get authors method above, is similar, but that method checks the current change set (checks the first time)
+ */
+def lastCommitByJenkins() {
+    return COMMIT_EMAIL_ADDRESS != null && !COMMIT_EMAIL_ADDRESS.isEmpty() &&  JENKINS_USER_EMAIL == COMMIT_EMAIL_ADDRESS
+}
+
+
+/**
+ * Checks out a git branch
+ *
+ * @param url git url
+ * @param branchName git branch name
+ * @param appWorkspace app workspace
+ * @param appPath app path
+ */
+def checkoutBranch(String url, String branchName, String appWorkspace, String appPaths) {
+	echo "TRACKER || Jenkinsfile || checkoutBranch(String url, String branchName ${branchName}, String appWorkspace ${appWorkspace}, String appPaths ${appPaths})"
+    def paths = []
+    def branchExtensions
+
+    //build the branch extensions (by paths or by full repo)
+    if (appPaths != null && !appPaths.isEmpty()) {
+        for (String appPath in appPaths.split(",")) {
+            paths.add([$class: 'SparseCheckoutPath', path: appPath])
+        }
+
+        branchExtensions = [[$class: 'SparseCheckoutPaths', sparseCheckoutPaths: paths]]
+    } else
+        branchExtensions = [[$class: 'LocalBranch']]
+
+    //check the branch out into the app workspace directory
+    dir(appWorkspace) {
+        try {
+            def  SOURCE_CREDENTIALS_ID = GIT_CREDENTIALS_ID
+            if(url.startsWith("https://github.com")){
+                SOURCE_CREDENTIALS_ID = GITHUB_CREDENTIALS_ID
+            }
+            echo "Cloning $branchName branch..."
+            checkout([
+                    $class           : 'GitSCM',
+                    branches         : [[name: branchName]],
+                    extensions       : branchExtensions,
+                    userRemoteConfigs: [[credentialsId: SOURCE_CREDENTIALS_ID, url: url]]
+            ])
+        }
+        catch (Exception e) {
+            echo "checkout branch error message ${e.getMessage()}"
+        }
+    }
+}

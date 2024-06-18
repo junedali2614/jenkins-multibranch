@@ -1,0 +1,36 @@
+pipeline {
+    agent any
+
+    environment {
+        TEST1 = 'ENV_TEST1'
+        TEST2 = 'ENV_TEST2'
+    }
+
+    parameters {
+        string(name: 'GIT_URL', defaultValue: 'DEFAULT_URL', description: 'URL of upstream repo from where this job got triggered')
+        text(name: 'BRANCH_NAME', defaultValue: 'DEFAULT_BRANCH', description: 'Branch of upstream repo from where this job got triggered')
+    }
+
+   
+
+    stages {
+        stage('Run Job As Per Inputs Received From Upstream Job') {
+            steps {
+                script {
+                    node() {
+                        echo 'Hello World'
+                        echo "TEST1: ${TEST1}"
+                        echo "TEST2: ${env.TEST2}"
+                        echo "GIT_URL: ${params.GIT_URL}"
+                        echo "BRANCH_NAME: ${params.BRANCH_NAME}"
+
+                        // added sleep to test lock
+                        sh '''
+                            sleep 20
+                        '''
+                    }
+                }
+            }
+        }
+    }
+}

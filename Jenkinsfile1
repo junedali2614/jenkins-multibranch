@@ -1,0 +1,68 @@
+pipeline {
+    agent any
+
+    environment {
+        TEST1 = 'ENV_TEST1'
+        TEST2 = 'ENV_TEST2'
+        SONARQUBE_SERVER = 'SonarQube'  // Name of the SonarQube server configured in Jenkins
+        SONARQUBE_TOKEN = credentials('sonarqube-token')  // Credential ID for SonarQube token
+        PROJECT_KEY = 'your-project-key'  // SonarQube project key
+        PROJECT_NAME = 'your-project-name'  // SonarQube project name
+        PROJECT_VERSION = '1.0'  // Project version
+    }
+
+    parameters {
+        string(name: 'GIT_URL', defaultValue: 'DEFAULT_URL', description: 'URL of upstream repo from where this job got triggered')
+        text(name: 'BRANCH_NAME', defaultValue: 'DEFAULT_BRANCH', description: 'Branch of upstream repo from where this job got triggered')
+    }
+
+    stages {
+        stage('Run Job As Per Inputs Received From Upstream Job') {
+            steps {
+                script {
+                    node() {
+                        echo 'Hello World'
+                        echo "TEST1: ${TEST1}"
+                        echo "TEST2: ${env.TEST2}"
+                        echo "GIT_URL: ${params.GIT_URL}"
+                        echo "BRANCH_NAME: ${params.BRANCH_NAME}"
+
+                        // added sleep to test lock
+                        sh '''
+                            sleep 20
+                        '''
+                    }
+                }
+            }
+        }
+        stage('SonarQube Analysis') {
+            steps {
+                withSonarQubeEnv('SonarQube') {  // 'SonarQube' is the name of the SonarQube server configured in Jenkins
+                    script {
+                        // Example SonarQube scanner command, replace with your project settings
+                        sh """
+                        sonar-scanner \
+                        -Dsonar.projectKey=${PROJECT_KEY} \
+                        -Dsonar.projectName=${PROJECT_NAME} \
+                        -Dsonar.projectVersion=${PROJECT_VERSION} \
+                        -Dsonar.sources=. \
+                        -Dsonar.host.url=${env.SONAR_HOST_URL} \
+                        -Dsonar.login=${SONARQUBE_TOKEN}
+                        """
+                    }
+                }
+            }
+        }
+        
+        stage('Quality Gate') {
+            steps {
+                script {
+                    timeout(time: 1, unit: 'MINUTES') {
+                        waitForQualityGate abortPipeline: true
+                    }
+                }
+            }
+        }
+
+    }
+}
